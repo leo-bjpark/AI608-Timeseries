@@ -52,6 +52,51 @@ def prepare_var_data(df: pd.DataFrame, var_names, dropna: bool = True):
     return data_df, data
 
 
+def compute_adf_pvalues(data_df: pd.DataFrame, var_names, autolag: str = "AIC") -> pd.Series:
+    """Compute ADF p-values for selected variables."""
+    try:
+        from statsmodels.tsa.stattools import adfuller
+    except ImportError as exc:
+        raise ImportError("statsmodels is required for ADF checks. Install with `pip install statsmodels`.") from exc
+
+    pvals = {}
+    for col in var_names:
+        series = data_df[col].dropna()
+        if len(series) < 10:
+            pvals[col] = np.nan
+        else:
+            pvals[col] = adfuller(series, autolag=autolag)[1]
+    return pd.Series(pvals, name="adf_pvalue")
+
+
+def apply_var_preprocessing(raw_df: pd.DataFrame, mode: str = "logdiff", enabled: bool = True) -> pd.DataFrame:
+    """
+    Apply optional preprocessing to VAR input series.
+    - enabled=False: return level data
+    - enabled=True, mode='logdiff': return log-differenced data
+    - enabled=True, mode='level': return level data
+    """
+    if not enabled or mode == "level":
+        return raw_df.copy()
+    if mode == "logdiff":
+        return np.log(raw_df).diff().dropna()
+    raise ValueError(f"Unsupported preprocessing mode: {mode}. Use 'level' or 'logdiff'.")
+
+
+def summarize_preprocess_on_off(raw_df: pd.DataFrame, var_names, mode: str = "logdiff") -> pd.DataFrame:
+    """Return ADF comparison table for preprocessing OFF(level) vs ON(mode)."""
+    off_df = apply_var_preprocessing(raw_df, mode=mode, enabled=False)
+    on_df = apply_var_preprocessing(raw_df, mode=mode, enabled=True)
+
+    out = pd.DataFrame(
+        {
+            "adf_off_level": compute_adf_pvalues(off_df, var_names),
+            f"adf_on_{mode}": compute_adf_pvalues(on_df, var_names),
+        }
+    )
+    return out
+
+
 def summarize_data(data_df: pd.DataFrame) -> pd.DataFrame:
     """Return compact summary stats used in the tutorial output."""
     return data_df.describe().T[["mean", "std", "min", "max"]]
@@ -117,7 +162,15 @@ def plot_stability_eigenvalues(eigvals: np.ndarray, figsize=(4.4, 4.4)):
     plt.show()
 
 
-def plot_irf(irf: np.ndarray, var_names=None, shock_names=None, sharey: bool = True):
+def plot_irf(
+    irf: np.ndarray,
+    var_names=None,
+    shock_names=None,
+    sharey: bool = True,
+    figsize=(7, 6),
+    t_ref=None,
+    layout: str = "matrix",
+):
     """
     Plot IRFs as a y-by-u matrix:
     - Row i: response variable y_i
@@ -132,37 +185,61 @@ def plot_irf(irf: np.ndarray, var_names=None, shock_names=None, sharey: bool = T
     if shock_names is None:
         shock_names = [f"u{i + 1}" for i in range(k)]
 
-    fig, axes = plt.subplots(
-        k,
-        k,
-        figsize=(3.2 * k, 2.4 * k),
-        sharex=True,
-        sharey=sharey,
-        squeeze=False,
-    )
-
-    row_lims = {}
-    if not sharey:
+    if layout == "response_panels":
+        fig, axes = plt.subplots(
+            k,
+            1,
+            figsize=figsize,
+            sharex=True,
+            sharey=sharey,
+            squeeze=False,
+        )
         for i in range(k):
-            vals = irf[:, i, :]
-            lim = 1.08 * np.max(np.abs(vals))
-            row_lims[i] = (-lim, lim) if lim > 0 else (-1.0, 1.0)
-
-    for i in range(k):
-        for j in range(k):
-            ax = axes[i, j]
-            ax.plot(horizons, irf[:, i, j], lw=2.0, color=f"C{i}")
+            ax = axes[i, 0]
+            for j in range(k):
+                ax.plot(horizons, irf[:, i, j], lw=2.0, color=f"C{j}", label=shock_names[j])
             ax.axhline(0, color="black", lw=0.9, alpha=0.75)
-            if not sharey:
-                ax.set_ylim(*row_lims[i])
+            ax.set_ylabel(f"{var_names[i]} response")
             if i == 0:
-                ax.set_title(f"Shock: {shock_names[j]}", fontsize=10)
-            if j == 0:
-                ax.set_ylabel(f"{var_names[i]} response")
+                ax.legend(frameon=True, ncol=min(k, 4), loc="upper right", title="Shock (u)")
             if i == k - 1:
                 ax.set_xlabel("Horizon")
+    else:
+        fig, axes = plt.subplots(
+            k,
+            k,
+            figsize=figsize,
+            sharex=True,
+            sharey=sharey,
+            squeeze=False,
+        )
 
-    fig.suptitle("Impulse Responses (y <- u)", y=1.01, fontsize=13)
+        row_lims = {}
+        if not sharey:
+            for i in range(k):
+                vals = irf[:, i, :]
+                lim = 1.08 * np.max(np.abs(vals))
+                row_lims[i] = (-lim, lim) if lim > 0 else (-1.0, 1.0)
+
+        for i in range(k):
+            for j in range(k):
+                ax = axes[i, j]
+                ax.plot(horizons, irf[:, i, j], lw=2.0, color=f"C{i}")
+                ax.axhline(0, color="black", lw=0.9, alpha=0.75)
+                if not sharey:
+                    ax.set_ylim(*row_lims[i])
+                if i == 0:
+                    ax.set_title(f"Shock: {shock_names[j]}", fontsize=10)
+                if j == 0:
+                    ax.set_ylabel(f"{var_names[i]} response")
+                if i == k - 1:
+                    ax.set_xlabel("Horizon")
+
+    if t_ref is None:
+        title = "Impulse Responses (y <- u)"
+    else:
+        title = f"Impulse Responses (y <- u), shock at t={t_ref}"
+    fig.suptitle(title, y=1.01, fontsize=13)
     plt.tight_layout()
     plt.show()
 
@@ -172,7 +249,7 @@ def plot_irf_horizon_heatmap(
     h_plot: int,
     var_names,
     shock_names,
-    figsize=(4.4, 3.6),
+    figsize=(4.0, 3.0),
 ):
     """Plot IRF matrix at horizon h (rows: response y_i, columns: shock u_j)."""
     fig, ax = plt.subplots(figsize=figsize)
@@ -186,5 +263,48 @@ def plot_irf_horizon_heatmap(
         for j in range(len(var_names)):
             ax.text(j, i, f"{irf[h_plot, i, j]:.2f}", ha="center", va="center", fontsize=9)
     plt.colorbar(im, ax=ax, fraction=0.045, pad=0.04)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_irf_by_tref(
+    irf: np.ndarray,
+    response_idx: int,
+    shock_idx: int,
+    t_refs,
+    var_names=None,
+    shock_names=None,
+    max_h: int = None,
+    figsize=(7.2, 4.0),
+):
+    """
+    Plot one IRF path with multiple reference times:
+    - x-axis: calendar time t (not horizon h)
+    - hue/color: reference shock time t_ref
+    """
+    H_plus_1, k, _ = irf.shape
+    if max_h is None:
+        max_h = H_plus_1 - 1
+    if max_h < 0 or max_h >= H_plus_1:
+        raise ValueError(f"max_h must be in [0, {H_plus_1 - 1}], got {max_h}")
+
+    if var_names is None:
+        var_names = [f"y{i + 1}" for i in range(k)]
+    if shock_names is None:
+        shock_names = [f"u{i + 1}" for i in range(k)]
+
+    path = irf[: max_h + 1, response_idx, shock_idx]
+    horizons = np.arange(max_h + 1)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    for n, t_ref in enumerate(t_refs):
+        t_axis = t_ref + horizons
+        ax.plot(t_axis, path, lw=2.0, color=f"C{n % 10}", label=f"t_ref={t_ref}")
+
+    ax.axhline(0, color="black", lw=0.9, alpha=0.75)
+    ax.set_xlabel("Time t")
+    ax.set_ylabel("Response")
+    ax.set_title(f"{var_names[response_idx]} response to {shock_names[shock_idx]}")
+    ax.legend(frameon=True, title="Reference time")
     plt.tight_layout()
     plt.show()
